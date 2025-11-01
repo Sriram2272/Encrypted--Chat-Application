@@ -1,0 +1,448 @@
+# Encrypted Chat App — Fullstack (Replit)
+
+This repository contains a **fullstack encrypted chat app** scaffolded for Replit Core. Two interfaces: **Admin** and **User**. The app uses **end-to-end encryption (E2EE)** — messages are encrypted/decrypted in the browser. The server **never** sees plaintext messages.
+
+---
+
+## Architecture & choices (short)
+- Frontend: React (single-page), Socket.IO client, libsodium-wrappers for crypto, IndexedDB (local storage) for private key storage.
+- Backend: Node.js + Express, Socket.IO server, SQLite (simple persistent store), bcrypt for password hashing, jsonwebtoken for auth.
+- Crypto model: Each user generates an X25519 keypair (libsodium). Public key uploaded to server. For 1:1 chat, sender derives a symmetric key using `crypto_box` (or `crypto_kx`) to encrypt messages with symmetric `crypto_secretbox`. Messages stored on server only in ciphertext.
+- Admin: manage users, disable accounts, view metadata (no plaintext messages), broadcast (server-signed) notices.
+- Security notes: Private keys never leave the client. If user clears browser, they lose their private key (provide backup/export option). Use HTTPS (Replit provides it). JWTs short-lived.
+
+---
+
+## Folder structure (what you'll see in Replit)
+```
+/root
+  /server
+    package.json
+    index.js
+    db.js
+    auth.js
+    sockets.js
+    migrations/
+  /client
+    package.json
+    src/
+      App.jsx
+      index.jsx
+      components/
+        Login.jsx
+        Register.jsx
+        Chat.jsx
+        AdminPanel.jsx
+      utils/
+        crypto.js
+        api.js
+  README.md
+```
+
+---
+
+## How it works (detailed)
+1. **Register**: client creates password, server stores hashed password. Client generates a libsodium keypair (X25519) and sends **public key** to server with registration. Client stores private key in IndexedDB.
+2. **Login**: server verifies credentials and returns a JWT. Client fetches recipient public keys from server.
+3. **Key agreement**: For a chat message from A to B, A uses A's private key + B's public key to derive a shared symmetric key (HKDF) and encrypts the message with `crypto_secretbox` + nonce. Message sent to server as `{to: B.id, from: A.id, ciphertext, nonce, timestamp}`.
+4. **Delivery**: Server stores encrypted message and emits via Socket.IO to recipient(s). Recipient receives ciphertext and nonce and uses derived symmetric key to decrypt locally.
+5. **Admin**: Admin cannot decrypt messages because they don't have users' private keys. They can only see metadata (timestamps, from, to, message length) and perform account actions.
+
+---
+
+## Server: key files
+
+### server/package.json
+```json
+{
+  "name": "enc-chat-server",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.0",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0",
+    "socket.io": "^4.7.2",
+    "better-sqlite3": "^8.4.0",
+    "cors": "^2.8.5",
+    "libsodium-wrappers": "^0.7.9"
+  }
+}
+```
+
+### server/db.js (SQLite helper)
+```js
+const Database = require('better-sqlite3');
+const db = new Database('./data.sqlite');
+// migrations (simple)
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT UNIQUE,
+  password_hash TEXT,
+  public_key TEXT,
+  is_admin INTEGER DEFAULT 0,
+  disabled INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sender INTEGER,
+  receiver INTEGER,
+  ciphertext TEXT,
+  nonce TEXT,
+  created_at INTEGER
+);
+`);
+
+module.exports = db;
+```
+
+### server/auth.js (auth routes)
+```js
+const express = require('express');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const db = require('./db');
+const router = express.Router();
+const SECRET = process.env.JWT_SECRET || 'replace_this_in_env';
+
+router.post('/register', async (req, res) => {
+  const { username, password, publicKey, isAdmin } = req.body;
+  if (!username || !password || !publicKey) return res.status(400).send({ error: 'missing' });
+  const hash = await bcrypt.hash(password, 10);
+  try {
+    const stmt = db.prepare('INSERT INTO users (username, password_hash, public_key, is_admin) VALUES (?, ?, ?, ?)');
+    const info = stmt.run(username, hash, publicKey, isAdmin ? 1 : 0);
+    res.json({ ok: true, id: info.lastInsertRowid });
+  } catch (e) {
+    res.status(400).json({ error: 'username taken' });
+  }
+});
+
+router.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+  const row = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  if (!row) return res.status(401).json({ error: 'invalid' });
+  const match = await bcrypt.compare(password, row.password_hash);
+  if (!match) return res.status(401).json({ error: 'invalid' });
+  if (row.disabled) return res.status(403).json({ error: 'disabled' });
+  const token = jwt.sign({ id: row.id, username: row.username, isAdmin: !!row.is_admin }, SECRET, { expiresIn: '4h' });
+  res.json({ token, id: row.id, username: row.username, isAdmin: !!row.is_admin });
+});
+
+router.get('/user/:id/pubkey', (req, res) => {
+  const row = db.prepare('SELECT id, username, public_key FROM users WHERE id = ?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'notfound' });
+  res.json({ id: row.id, username: row.username, publicKey: row.public_key });
+});
+
+module.exports = router;
+```
+
+### server/sockets.js (socket handling + message store)
+```js
+const jwt = require('jsonwebtoken');
+const db = require('./db');
+const SECRET = process.env.JWT_SECRET || 'replace_this_in_env';
+
+module.exports = function(io) {
+  io.use((socket, next) => {
+    const token = socket.handshake.auth?.token;
+    try {
+      const data = jwt.verify(token, SECRET);
+      socket.user = data;
+      return next();
+    } catch (e) { return next(new Error('unauthorized')); }
+  });
+
+  io.on('connection', (socket) => {
+    const uid = socket.user.id;
+    socket.join('u:' + uid);
+
+    socket.on('send_message', (payload) => {
+      // payload: { to, ciphertext, nonce }
+      const stmt = db.prepare('INSERT INTO messages (sender, receiver, ciphertext, nonce, created_at) VALUES (?, ?, ?, ?, ?)');
+      stmt.run(uid, payload.to, payload.ciphertext, payload.nonce, Date.now());
+      io.to('u:' + payload.to).emit('message', { from: uid, ciphertext: payload.ciphertext, nonce: payload.nonce, ts: Date.now() });
+    });
+
+    socket.on('fetch_messages', ({ withUser }) => {
+      const rows = db.prepare('SELECT * FROM messages WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?) ORDER BY created_at').all(uid, withUser, withUser, uid);
+      socket.emit('messages', rows);
+    });
+  });
+};
+```
+
+### server/index.js (app entry)
+```js
+const express = require('express');
+const http = require('http');
+const cors = require('cors');
+const { Server } = require('socket.io');
+const authRoutes = require('./auth');
+const db = require('./db');
+const sockets = require('./sockets');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use('/auth', authRoutes);
+
+// admin endpoints (basic)
+app.get('/admin/users', (req, res) => {
+  const rows = db.prepare('SELECT id, username, public_key, is_admin, disabled FROM users').all();
+  res.json(rows);
+});
+
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+sockets(io);
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log('Server listening on', PORT));
+```
+
+---
+
+## Client: key files
+
+### client/package.json
+```json
+{
+  "name": "enc-chat-client",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "socket.io-client": "^4.7.2",
+    "libsodium-wrappers": "^0.7.9",
+    "axios": "^1.5.0"
+  },
+  "scripts": {
+    "start": "vite"
+  }
+}
+```
+
+### client/src/utils/crypto.js
+```js
+// wrapper for libsodium operations used in app
+import sodium from 'libsodium-wrappers';
+
+export async function initSodium() { await sodium.ready; return sodium; }
+
+export async function generateKeypair() {
+  await sodium.ready;
+  const kp = sodium.crypto_kx_keypair(); // X25519 keys
+  return { publicKey: sodium.to_base64(kp.publicKey), privateKey: sodium.to_base64(kp.privateKey) };
+}
+
+export function exportKey(base64) { return base64; }
+export function importKey(b64) { return b64; }
+
+// derive shared symmetric key (sender private + receiver public)
+export async function deriveSharedKey(senderPrivB64, receiverPubB64) {
+  await sodium.ready;
+  const senderPriv = sodium.from_base64(senderPrivB64);
+  const receiverPub = sodium.from_base64(receiverPubB64);
+  // Use crypto_kx to derive shared rx/tx keys
+  const keys = sodium.crypto_kx_client_session_keys(senderPriv, senderPriv, receiverPub);
+  // keys.sharedTx / sharedRx are Uint8Array
+  const shared = keys.sharedTx || keys.sharedRx;
+  return sodium.to_base64(shared);
+}
+
+export async function encrypt(sharedKeyB64, message) {
+  await sodium.ready;
+  const key = sodium.from_base64(sharedKeyB64);
+  const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
+  const ciphertext = sodium.crypto_secretbox_easy(message, nonce, key);
+  return { ciphertext: sodium.to_base64(ciphertext), nonce: sodium.to_base64(nonce) };
+}
+
+export async function decrypt(sharedKeyB64, ciphertextB64, nonceB64) {
+  await sodium.ready;
+  const key = sodium.from_base64(sharedKeyB64);
+  const ct = sodium.from_base64(ciphertextB64);
+  const nonce = sodium.from_base64(nonceB64);
+  const decrypted = sodium.crypto_secretbox_open_easy(ct, nonce, key);
+  return sodium.to_string(decrypted);
+}
+```
+
+> NOTE: In a production-level setup you'd use a carefully-reviewed key-agreement pattern (`crypto_kx` usage above is simplified for illustration). Always have crypto reviewed.
+
+### client/src/components/Register.jsx
+```jsx
+import React, { useState } from 'react';
+import axios from 'axios';
+import { generateKeypair } from '../utils/crypto';
+
+export default function Register() {
+  const [u, setU] = useState('');
+  const [p, setP] = useState('');
+  async function doRegister() {
+    const kp = await generateKeypair();
+    // store private key in IndexedDB / localStorage
+    localStorage.setItem('privKey', kp.privateKey);
+    await axios.post('http://localhost:3000/auth/register', { username: u, password: p, publicKey: kp.publicKey });
+    alert('registered');
+  }
+  return (
+    <div>
+      <input value={u} onChange={e=>setU(e.target.value)} placeholder="username" />
+      <input type="password" value={p} onChange={e=>setP(e.target.value)} placeholder="password" />
+      <button onClick={doRegister}>Register</button>
+    </div>
+  );
+}
+```
+
+### client/src/components/Login.jsx
+```jsx
+import React, { useState } from 'react';
+import axios from 'axios';
+
+export default function Login({ setToken }) {
+  const [u, setU] = useState('');
+  const [p, setP] = useState('');
+  async function doLogin() {
+    const r = await axios.post('http://localhost:3000/auth/login', { username: u, password: p });
+    localStorage.setItem('token', r.data.token);
+    localStorage.setItem('myId', r.data.id);
+    setToken(r.data.token);
+  }
+  return (
+    <div>
+      <input value={u} onChange={e=>setU(e.target.value)} placeholder="username" />
+      <input type="password" value={p} onChange={e=>setP(e.target.value)} placeholder="password" />
+      <button onClick={doLogin}>Login</button>
+    </div>
+  );
+}
+```
+
+### client/src/components/Chat.jsx
+```jsx
+import React, { useEffect, useState } from 'react';
+import io from 'socket.io-client';
+import axios from 'axios';
+import { initSodium, deriveSharedKey, encrypt, decrypt } from '../utils/crypto';
+
+export default function Chat({ token }) {
+  const [socket, setSocket] = useState(null);
+  const [peerId, setPeerId] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState('');
+
+  useEffect(() => { if (!token) return; const s = io('http://localhost:3000', { auth: { token } }); setSocket(s); return ()=>s.disconnect(); }, [token]);
+
+  useEffect(() => {
+    if (!socket) return;
+    socket.on('message', async (m) => {
+      // decrypt using local private key and peer public key
+      const myId = localStorage.getItem('myId');
+      const priv = localStorage.getItem('privKey');
+      const peerPubRes = await axios.get('http://localhost:3000/auth/user/' + m.from + '/pubkey');
+      const shared = await deriveSharedKey(priv, peerPubRes.data.publicKey);
+      const plain = await decrypt(shared, m.ciphertext, m.nonce);
+      setMessages(prev=>[...prev, { from: m.from, text: plain }]);
+    });
+  }, [socket]);
+
+  async function send() {
+    const priv = localStorage.getItem('privKey');
+    const peerPubRes = await axios.get('http://localhost:3000/auth/user/' + peerId + '/pubkey');
+    const shared = await deriveSharedKey(priv, peerPubRes.data.publicKey);
+    const enc = await encrypt(shared, text);
+    socket.emit('send_message', { to: Number(peerId), ciphertext: enc.ciphertext, nonce: enc.nonce });
+    setMessages(prev=>[...prev, { from: 'me', text }]);
+    setText('');
+  }
+
+  return (
+    <div>
+      <input value={peerId} onChange={e=>setPeerId(e.target.value)} placeholder="peer user id" />
+      <div style={{border:'1px solid #ccc', minHeight:200}}>
+        {messages.map((m,i)=>(<div key={i}><b>{m.from}</b>: {m.text}</div>))}
+      </div>
+      <input value={text} onChange={e=>setText(e.target.value)} placeholder="message" />
+      <button onClick={send}>Send</button>
+    </div>
+  );
+}
+```
+
+### client/src/components/AdminPanel.jsx
+```jsx
+import React, { useEffect, useState } from 'react';
+import axios from 'axios';
+
+export default function AdminPanel({ token }){
+  const [users, setUsers] = useState([]);
+  useEffect(()=>{
+    axios.get('http://localhost:3000/admin/users', { headers: { Authorization: 'Bearer ' + token } }).then(r=>setUsers(r.data));
+  },[]);
+  return (
+    <div>
+      <h3>Users (admin)</h3>
+      <table>
+        <thead><tr><th>id</th><th>username</th><th>is_admin</th><th>disabled</th></tr></thead>
+        <tbody>{users.map(u=>(<tr key={u.id}><td>{u.id}</td><td>{u.username}</td><td>{u.is_admin}</td><td>{u.disabled}</td></tr>))}</tbody>
+      </table>
+    </div>
+  );
+}
+```
+
+---
+
+## Replit-specific steps (quick)
+1. Create a new Replit using "Node.js" (or Node + React template). Create two folders `/server` and `/client` and copy files as above.
+2. In Replit `server` install deps: `npm install` (server). In `client` install deps and run vite.
+3. Expose ports: set server to listen on `process.env.PORT` (Replit supplies it). Configure client dev server proxy to server or build static and serve from Express in production.
+4. Add `JWT_SECRET` in Replit's Secrets/Env.
+
+---
+
+## Important UX/security features to add (do these before production)
+- Private key backup / export. Warn users if they lose it they can't recover messages.
+- Use ephemeral JWTs, rotating refresh tokens.
+- Implement perfect-forward secrecy pattern (rotate ephemeral keys per session).
+- Rate-limiting & brute-force protection.
+- Content moderation meta tags only (never decrypt on server).
+- Use HTTPS (Replit provides it) and CSP headers.
+
+---
+
+## Testing checklist
+- [ ] Register user A, B. Verify public keys stored.
+- [ ] Login A, login B in another browser. A sends encrypted message; B receives and decrypts plaintext.
+- [ ] Confirm server DB stores only ciphertext and nonce.
+- [ ] Admin cannot decrypt messages.
+- [ ] Clear localStorage to mimic lost private key — verify messages can't be opened.
+
+---
+
+## Files included in this doc
+I included minimal yet complete code snippets for key files. Copy them into matching files in Replit and run. This is a working skeleton — adjust UI and production hardening as required.
+
+---
+
+## License & credits
+This scaffold is provided as-is for educational purposes. Use libsodium and review cryptographic designs before production.
+
+
+
+
+
+---
+
+## Budget & Delivery Note
+The Replit AI prompt and project scaffold should include a clear budget requirement: **complete the scaffold and deliver the working server + client + README for a one-time budget of $15**. The deliverable must be realistic to implement within that budget (minimal UI polish, working E2EE flow, socket messaging, and deployment steps). If further paid work is needed (production hardening, automated tests, performance tuning), list these as optional add-ons with estimated costs.
